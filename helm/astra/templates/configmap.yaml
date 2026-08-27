@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "astra.fullname" . }}-config
+  labels:
+    {{- include "astra.labels" . | nindent 4 }}
+data:
+  CONFIDENCE_THRESHOLD: {{ .Values.config.confidenceThreshold | quote }}
+  DRY_RUN: {{ .Values.config.dryRun | quote }}
+  MAX_INVESTIGATION_ROUNDS: {{ .Values.config.maxInvestigationRounds | quote }}
+  MAX_CONCURRENT_WORKFLOWS: {{ .Values.config.maxConcurrentWorkflows | quote }}
+  LLM_MODEL: {{ .Values.config.llmModel | quote }}
+  AUDIT_DB_PATH: "{{ .Values.persistence.mountPath }}/astra_audit.db"

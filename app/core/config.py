@@ -11,6 +11,12 @@ from pydantic import Field
 
 class Settings(BaseSettings):
 
+    # ── Security ─────────────────────────────────────────────────────────────
+    astra_api_key: str = Field(
+        default="change-me-in-production",
+        description="API key required to call Astra webhooks",
+    )
+
     # ── LLM ──────────────────────────────────────────────────────────────────
     groq_api_key: str = Field(default="", description="Groq API key")
     llm_model: str    = Field(
@@ -33,6 +39,12 @@ class Settings(BaseSettings):
         default=3,
         description="Maximum number of diagnostic tool calls in the ReAct "
                     "investigation loop before the agent is forced to conclude.",
+    )
+    max_concurrent_workflows: int = Field(
+        default=10,
+        description="Maximum number of LLM investigations that can run simultaneously. "
+                    "Additional alerts are queued and processed as slots free up. "
+                    "Prevents Groq API rate limits when a large alert storm hits.",
     )
 
     # ── Slack (HITL Notifications) ────────────────────────────────────────────

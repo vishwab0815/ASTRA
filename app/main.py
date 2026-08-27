@@ -83,7 +83,65 @@ app.include_router(api_router)                  # /webhook, /alertmanager, /thre
 app.mount("/metrics", metrics_app)              # Prometheus scrape endpoint
 
 
-@app.get("/health", response_model=HealthResponse, tags=["system"])
-def health_check() -> HealthResponse:
-    """Returns 200 OK when the server is running. Used by load balancers and monitoring."""
-    return HealthResponse()
+@app.get("/health", tags=["system"], summary="Liveness probe — is Astra running?")
+def health_check() -> dict:
+    """
+    Shallow liveness probe — returns 200 OK if the server process is alive.
+    Used by Kubernetes liveness probes and load balancers.
+    """
+    return {"status": "healthy", "version": "0.4.0"}
+
+
+@app.get("/health/ready", tags=["system"], summary="Readiness probe — are all dependencies ready?")
+def readiness_check() -> JSONResponse:
+    """
+    Deep readiness probe — verifies all critical dependencies are operational.
+    Returns 200 OK only if Astra can actually serve requests.
+    Returns 503 Service Unavailable if any dependency is down.
+
+    Used by Kubernetes readiness probes to stop routing traffic to a broken pod.
+    Kubernetes will NOT send new requests to this pod while this returns 503.
+    """
+    import sqlite3
+    checks   = {}
+    healthy  = True
+
+    # ── Check 1: Audit database is readable ─────────────────────────────────
+    try:
+        conn = sqlite3.connect(settings.audit_db_path, timeout=2)
+        conn.execute("SELECT 1")
+        conn.close()
+        checks["audit_db"] = "ok"
+    except Exception as exc:
+        checks["audit_db"] = f"error: {exc}"
+        healthy = False
+
+    # ── Check 2: Checkpoint database is readable ────────────────────────────
+    try:
+        conn = sqlite3.connect("astra_checkpoints.db", timeout=2)
+        conn.execute("SELECT 1")
+        conn.close()
+        checks["checkpoint_db"] = "ok"
+    except Exception as exc:
+        checks["checkpoint_db"] = f"error: {exc}"
+        healthy = False
+
+    # ── Check 3: LLM API reachable (lightweight HEAD request, no token cost) ────
+    try:
+        import httpx
+        r = httpx.head("https://api.groq.com", timeout=3)
+        checks["llm_api"] = "ok" if r.status_code < 500 else f"degraded: HTTP {r.status_code}"
+    except Exception as exc:
+        # LLM unreachable is degraded but not fatal — we have the fallback chain
+        checks["llm_api"] = f"degraded: {exc}"
+        # Do not mark healthy=False for LLM — let the retry/fallback handle it
+
+    status_code = 200 if healthy else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status":  "ready" if healthy else "not_ready",
+            "version": "0.4.0",
+            "checks":  checks,
+        },
+    )

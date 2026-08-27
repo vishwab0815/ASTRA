@@ -11,6 +11,7 @@ import re
 import logging
 from app.api.schemas import AlertPayload
 from app.db.database import check_and_update_triage_cache
+from app.tools.k8s_tools import get_pod_annotations
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +32,22 @@ def extract_workload_name(pod_name: str) -> str:
 
 def should_triage_suppress(alert: AlertPayload, db_path: str, window_minutes: int = 5) -> bool:
     """
-    Evaluates whether an alert is part of an ongoing incident storm.
+    Evaluates whether an alert should be suppressed because of:
+    1. Enterprise Opt-Out (astra.ai/ignore annotation)
+    2. Ongoing incident storm (deduplication)
+    
     Returns True if the alert should be suppressed.
     """
+    # ── 1. Enterprise Opt-Out Check ───────────────────────────────────────────
+    annotations = get_pod_annotations(alert.pod, alert.namespace)
+    if annotations.get("astra.ai/ignore", "").lower() == "true":
+        logger.info(
+            f"Alert Triage: Suppressed alert '{alert.alert}' for '{alert.pod}'. "
+            f"Reason: Pod explicitly opted out via 'astra.ai/ignore' annotation."
+        )
+        return True
+
+    # ── 2. Deduplication Check ────────────────────────────────────────────────
     workload_name = extract_workload_name(alert.pod)
     
     # The deduplication key identifies the unique "incident"

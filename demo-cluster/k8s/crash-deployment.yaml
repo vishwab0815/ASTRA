@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-crash-app
+  namespace: astra-tests
+  labels:
+    app: frontend-crash-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend-crash-app
+  template:
+    metadata:
+      labels:
+        app: frontend-crash-app
+    spec:
+      containers:
+      - name: crash-container
+        image: busybox:latest
+        command:
+        - /bin/sh
+        - -c
+        - "echo 'Starting up...'; sleep 2; echo 'Out of memory!'; exit 137"

@@ -21,7 +21,8 @@ Adding new nodes:
 """
 
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
 
 from app.agent.state import AstraState
 from app.agent.nodes import investigate, plan, act
@@ -49,11 +50,12 @@ def build_graph() -> StateGraph:
     graph.add_edge("plan",        "act")
     graph.add_edge("act",         END)
 
-    # ── Compile with HITL checkpointing ───────────────────────────────────────
+    # ── Compile with HITL checkpointing (Persistent) ──────────────────────────
     # interrupt_before=["act"] pauses the graph BEFORE executing the act node.
     # The API layer checks confidence and either auto-resumes or holds for human approval.
-    # MemorySaver stores the paused state in memory keyed by thread_id.
-    memory = MemorySaver()
+    # SqliteSaver stores the paused state on disk, so it survives server restarts.
+    conn = sqlite3.connect("astra_checkpoints.db", check_same_thread=False)
+    memory = SqliteSaver(conn)
     return graph.compile(checkpointer=memory, interrupt_before=["act"])
 
 

@@ -1,13 +1,32 @@
-langgraph>=0.1.0
-langchain>=0.2.0
-langchain-groq>=0.2.0
-python-dotenv>=1.0.0
-pytest>=8.0.0
+# ── Core Framework ────────────────────────────────────────────────────────────
 fastapi>=0.100.0
 uvicorn>=0.22.0
-kubernetes>=28.1.0
 pydantic-settings>=2.0.0
+
+# ── AI / LangGraph Agent ──────────────────────────────────────────────────────
+langgraph>=0.1.0
+langgraph-checkpoint-sqlite          # Persistent state (SqliteSaver) — survives server restarts
+langchain>=0.2.0
+langchain-groq>=0.2.0
+
+# ── Kubernetes Integration ────────────────────────────────────────────────────
+kubernetes>=28.1.0
+
+# ── HTTP Client (used by trace_tools to query Jaeger) ────────────────────────
 httpx>=0.27.0
+
+# ── Observability ─────────────────────────────────────────────────────────────
+prometheus-client>=0.20.0            # /metrics endpoint for Prometheus scraping
+
+# ── Human-in-the-Loop Notifications ──────────────────────────────────────────
+slack-sdk>=3.30.0                    # Optional: set SLACK_BOT_TOKEN in .env to enable
+
+# ── GitOps Remediation ────────────────────────────────────────────────────────
+ruamel.yaml                          # Safe YAML parser — preserves comments and formatting
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0
 pytest-asyncio>=0.23.0
-prometheus-client>=0.20.0
-slack-sdk>=3.30.0

@@ -1,0 +1,87 @@
+# Default values for Astra AIOps Engine.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: astra-engine
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# Security context for the Astra Pod
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 8081
+
+# ── Astra Application Configuration ──────────────────────────────────────────
+
+config:
+  # Minimum confidence score to auto-execute a remediation
+  confidenceThreshold: "0.75"
+  # When true, write K8s operations are simulated and logged
+  dryRun: "true"
+  # Maximum number of diagnostic tool calls in the ReAct investigation loop
+  maxInvestigationRounds: "3"
+  # Maximum number of LLM investigations that can run simultaneously
+  maxConcurrentWorkflows: "10"
+  # Groq model to use for all LLM calls
+  llmModel: "llama-3.1-8b-instant"
+
+# ── Sensitive Keys (Should be injected via CI/CD or Secrets Manager) ───────
+secrets:
+  # Required: Groq API Key
+  groqApiKey: ""
+  # Required: API Key to secure Astra's Webhook Endpoint
+  astraApiKey: "change-me-in-production"
+  # Optional: Slack Token for Human-in-the-Loop notifications
+  slackBotToken: ""
+  # Optional: Slack Channel ID for HITL alerts
+  slackChannelId: ""
+
+# ── Persistence for Checkpoints & RAG Vector DB ────────────────────────────
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  # Where to mount the volume inside the container
+  mountPath: "/app/data"
+
+resources:
+  # We recommend setting requests and limits for enterprise deployments
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+  requests:
+    cpu: 200m
+    memory: 1Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

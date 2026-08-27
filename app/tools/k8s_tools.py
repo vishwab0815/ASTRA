@@ -58,6 +58,21 @@ except Exception as exc:
     _core_v1 = None
 
 
+def get_pod_annotations(pod: str, namespace: str = "default") -> dict[str, str]:
+    """
+    Fetch the annotations of a specific pod.
+    Used by the Triage engine to check for enterprise opt-out flags like 'astra.ai/ignore'.
+    """
+    if K8S_AVAILABLE:
+        try:
+            pod_obj = _core_v1.read_namespaced_pod(name=pod, namespace=namespace)
+            return pod_obj.metadata.annotations or {}
+        except Exception as exc:
+            logger.debug(f"Could not fetch annotations for {pod}/{namespace}: {exc}")
+            return {}
+    return {}
+
+
 # ── Diagnostic tools (read-only) ───────────────────────────────────────────────
 
 def get_logs(pod: str, namespace: str = "default") -> str:

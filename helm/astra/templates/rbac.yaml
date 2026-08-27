@@ -1,0 +1,50 @@
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "astra.serviceAccountName" . }}
+  labels:
+    {{- include "astra.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "astra.fullname" . }}-clusterrole
+  labels:
+    {{- include "astra.labels" . | nindent 4 }}
+rules:
+  # Diagnostic read access
+  - apiGroups: ["", "apps", "batch"]
+    resources: ["pods", "events", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Remediation write access (restarting pods)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  # (Optional future capability: patching deployments)
+  # - apiGroups: ["apps"]
+  #   resources: ["deployments"]
+  #   verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "astra.fullname" . }}-clusterrolebinding
+  labels:
+    {{- include "astra.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "astra.fullname" . }}-clusterrole
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "astra.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

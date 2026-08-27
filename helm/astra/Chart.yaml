@@ -1,0 +1,11 @@
+apiVersion: v2
+name: astra
+description: Astra Enterprise Autonomous AIOps Engine
+type: application
+version: 0.1.0
+appVersion: "0.4.0"
+keywords:
+  - aiops
+  - self-healing
+  - ai
+  - kubernetes

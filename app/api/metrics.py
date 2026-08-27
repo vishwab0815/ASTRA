@@ -23,7 +23,7 @@ Prometheus scrape config (prometheus.yml):
         metrics_path: /metrics
 """
 
-from prometheus_client import Counter, Histogram, make_asgi_app
+from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
 from fastapi import APIRouter
 
 # ── Counters ──────────────────────────────────────────────────────────────────
@@ -54,6 +54,17 @@ ALERTS_APPROVED = Counter(
 ALERTS_REJECTED = Counter(
     name="astra_alerts_rejected_total",
     documentation="Paused alerts that an operator rejected and aborted",
+)
+
+# ── Gauges ────────────────────────────────────────────────────────────────────
+
+QUEUED_WORKFLOWS = Gauge(
+    name="astra_queued_workflows",
+    documentation=(
+        "Number of alerts currently waiting for a concurrency semaphore slot. "
+        "High values during an alert storm indicate the queue is backing up. "
+        "Tune MAX_CONCURRENT_WORKFLOWS in .env to control throughput."
+    ),
 )
 
 # ── Histograms ────────────────────────────────────────────────────────────────

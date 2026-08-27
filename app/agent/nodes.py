@@ -17,13 +17,17 @@ rather than guessing from the alert name alone.
 
 import json
 import logging
+import re
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from langchain_groq import ChatGroq
 from langchain_core.runnables import Runnable
 from langchain_core.messages import HumanMessage, SystemMessage
+from groq import RateLimitError
 
 from app.agent.state import AstraState
 from app.tools.k8s_tools import DIAGNOSTIC_TOOLS, execute_tool
 from app.core.config import settings
+from app.api.metrics import INVESTIGATION_ROUNDS
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,24 @@ logger = logging.getLogger(__name__)
 # Initialised lazily so the module can be imported without GROQ_API_KEY set.
 # Tests override this directly: import app.agent.nodes as n; n._llm = MagicMock()
 _llm: Runnable | None = None
+
+
+# ── LLM retry wrapper ─────────────────────────────────────────────────────────
+# When Groq returns a 429 Rate Limit, we automatically wait and retry
+# instead of crashing the investigation. Uses exponential backoff:
+# wait 4s, then 8s, then 16s (max 3 attempts total).
+@retry(
+    retry=retry_if_exception_type(RateLimitError),
+    wait=wait_exponential(multiplier=2, min=4, max=30),
+    stop=stop_after_attempt(3),
+    reraise=True,  # Re-raise the error after all retries are exhausted
+)
+def _invoke_llm(model: Runnable, messages: list) -> any:
+    """
+    Invoke the LLM with automatic retry on rate limit errors.
+    Separating this into its own function makes it easy to test and mock.
+    """
+    return model.invoke(messages)
 
 
 def _get_llm() -> Runnable:
@@ -77,9 +99,8 @@ def safe_json_parse(content: str) -> dict:
     """
     text = content.strip()
 
-    import re
     # Strip <think>...</think> blocks from reasoning models (e.g. DeepSeek R1, Groq)
-    text = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
     # Strategy 1: Clean JSON
     try:
@@ -230,7 +251,7 @@ def investigate(state: AstraState) -> AstraState:
             )),
         ]
 
-        response = model.invoke(messages)
+        response = _invoke_llm(model, messages)
         result   = safe_json_parse(response.content)
 
         if result["action"] == "conclude":
@@ -243,6 +264,8 @@ def investigate(state: AstraState) -> AstraState:
                     "root_cause":   result.get("root_cause"),
                 },
             )
+            # Record the number of rounds used in Prometheus for monitoring
+            INVESTIGATION_ROUNDS.observe(round_num)
             return {
                 **state,
                 "investigation_summary": evidence_text,
@@ -258,7 +281,8 @@ def investigate(state: AstraState) -> AstraState:
 
             if tool_name == "search_company_runbooks":
                 from app.tools.rag_tools import search_company_runbooks
-                tool_output = search_company_runbooks.invoke({"query": reason})
+                rag_query = reason.strip() if (reason and reason.strip()) else f"{pod} {alert.get('alert', '')}"
+                tool_output = search_company_runbooks.invoke({"query": rag_query})
             else:
                 tool_fn = DIAGNOSTIC_TOOLS.get(tool_name, DIAGNOSTIC_TOOLS["get_logs"])
                 tool_output = tool_fn(pod, namespace)
@@ -307,7 +331,7 @@ def plan(state: AstraState) -> AstraState:
         f"Namespace : {state['alert'].get('namespace', 'default')}"
     )
 
-    response = model.invoke([
+    response = _invoke_llm(model, [
         SystemMessage(content=PLAN_SYSTEM),
         HumanMessage(content=prompt),
     ])

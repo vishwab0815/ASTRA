@@ -78,10 +78,10 @@ class AgentResult(BaseModel):
 
 class WebhookResponse(BaseModel):
     """Response returned by the /webhook and /alertmanager endpoints."""
-    status:    str         = Field(..., description="resolved | paused_for_approval")
+    status:    str         = Field(..., description="processing | resolved | paused_for_approval | suppressed_by_triage")
     message:   str         = Field(..., description="Human-readable explanation of the status")
-    thread_id: str         = Field(..., description="Use this ID to approve/deny a paused workflow")
-    result:    AgentResult
+    thread_id: str         = Field(..., description="Use this ID to approve/deny a paused workflow or check history")
+    result:    Optional[AgentResult] = None
 
 
 class ApproveResponse(BaseModel):

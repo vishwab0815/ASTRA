@@ -20,7 +20,9 @@ The main workflow (POST /webhook) follows this pattern:
 
 import uuid
 import logging
-from fastapi import APIRouter, HTTPException
+import asyncio
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from app.agent.graph import astra_graph
 from app.agent.state import init_state
@@ -31,7 +33,7 @@ from app.services.alertmanager import parse_alertmanager_payload
 from app.api.metrics import (
     ALERTS_RECEIVED, ALERTS_RESOLVED, ALERTS_PAUSED,
     ALERTS_APPROVED, ALERTS_REJECTED,
-    CONFIDENCE_HISTOGRAM,
+    CONFIDENCE_HISTOGRAM, QUEUED_WORKFLOWS,
 )
 from app.api.schemas import (
     AlertPayload, AlertmanagerPayload, ApproveRequest,
@@ -40,36 +42,66 @@ from app.api.schemas import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["agent"])
+# ── API Authentication ────────────────────────────────────────────────────────
+security = HTTPBearer()
+
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verifies the Bearer token matches the ASTRA_API_KEY from .env"""
+    if credentials.credentials != settings.astra_api_key:
+        logger.warning("Rejected request due to invalid API Key.")
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+    return credentials.credentials
+
+# Protect all endpoints in this router
+router = APIRouter(tags=["agent"], dependencies=[Depends(verify_api_key)])
+
+# ── Concurrency Gate (Semaphore) ─────────────────────────────────────────────────
+# When a large alert storm hits (e.g. 500 alerts at once), without a limiter
+# every alert would simultaneously fire an LLM call, instantly hitting the
+# Groq rate limit and causing all 500 to fail.
+#
+# asyncio.Semaphore acts like a traffic light:
+#   - Only settings.max_concurrent_workflows investigations run at the same time
+#   - All other background tasks wait at 'async with _workflow_semaphore:'
+#   - As each investigation finishes, it releases the semaphore slot for the next one
+#
+# The semaphore is created lazily on first use because asyncio requires it
+# to be created inside a running event loop.
+_workflow_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Return the module-level semaphore, creating it lazily on first call."""
+    global _workflow_semaphore
+    if _workflow_semaphore is None:
+        _workflow_semaphore = asyncio.Semaphore(settings.max_concurrent_workflows)
+    return _workflow_semaphore
 
 
 # ── Helper ─────────────────────────────────────────────────────────────────────
 
-def _run_workflow(payload: AlertPayload) -> WebhookResponse:
+async def _run_workflow(payload: AlertPayload, thread_id: str) -> None:
     """
-    Core workflow execution — used by both /webhook and /alertmanager.
+    Core workflow execution — runs asynchronously as a BackgroundTask.
 
-    Starts the LangGraph graph, waits for the HITL interrupt before 'act',
-    then either auto-resumes (high confidence) or holds for human approval.
-    Writes an audit record regardless of outcome.
+    Uses asyncio.to_thread() to offload the synchronous LangGraph / LLM work
+    to a thread pool worker. This is critical: without this, a single 10-second
+    LLM call would block the FastAPI event loop, causing Astra to stop responding
+    to all other incoming webhooks during that time.
+
+    IMPORTANT: This function must never raise an exception. Because it runs in
+    a FastAPI BackgroundTask, any unhandled exception is silently swallowed
+    by the framework, meaning the alert is dropped with no trace in the audit log.
+    The outer try/except guarantees we always write an error record.
     """
     from app.services.triage import should_triage_suppress
-    
-    # ── Phase 1: Triage ───────────────────────────────────────────────────────
+
+    # ── Phase 1: Triage (fast, synchronous — no LLM involved) ─────────────────
     if should_triage_suppress(payload, settings.audit_db_path, window_minutes=5):
         logger.info(f"Dropping duplicate alert {payload.alert} for {payload.pod}")
-        return WebhookResponse(
-            status="suppressed_by_triage",
-            message="Alert suppressed by Triage Engine because an identical incident is currently being handled.",
-            thread_id="triage-suppressed",
-            result=AgentResult(
-                investigation_summary="Suppressed duplicate incident.",
-                confidence=0.0
-            )
-        )
+        return  # Suppressed, do nothing further
 
-    thread_id = str(uuid.uuid4())
-    config    = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}}
 
     logger.info(
         "Starting Astra workflow",
@@ -84,7 +116,7 @@ def _run_workflow(payload: AlertPayload) -> WebhookResponse:
     # Track this alert in Prometheus
     ALERTS_RECEIVED.labels(alert_name=payload.alert, namespace=payload.namespace).inc()
 
-    # Start audit record
+    # Start audit record — created before any LLM call so it always exists
     audit_event = record_workflow_start(
         thread_id=thread_id,
         alert_name=payload.alert,
@@ -92,85 +124,88 @@ def _run_workflow(payload: AlertPayload) -> WebhookResponse:
         namespace=payload.namespace,
     )
 
-    # ── Run the graph (investigate → plan → [PAUSE before act]) ──────────────
-    for _ in astra_graph.stream(init_state(payload.model_dump()), config):
-        pass  # Each iteration yields a node's output; we only need the final state
+    try:
+        # ── Concurrency Gate: acquire a semaphore slot before calling the LLM ──────
+        # If all slots are taken, this line yields control back to the event loop
+        # and waits until a running investigation finishes and releases its slot.
+        # The QUEUED_WORKFLOWS gauge lets engineers see the queue depth in real-time.
+        QUEUED_WORKFLOWS.inc()
+        async with _get_semaphore():
+            QUEUED_WORKFLOWS.dec()  # We have a slot — no longer queued
 
-    snapshot   = astra_graph.get_state(config)
-    values     = snapshot.values
-    confidence = values.get("confidence", 0.0)
+            # ── Run the graph in a thread pool to avoid blocking the event loop ──
+            # astra_graph.stream() is a synchronous generator that makes blocking LLM
+            # network calls. asyncio.to_thread() moves it to a worker thread so
+            # FastAPI can continue serving requests while the LLM is thinking.
+            def _run_graph_sync() -> None:
+                for _ in astra_graph.stream(init_state(payload.model_dump()), config):
+                    pass
 
-    # Record confidence in Prometheus histogram
-    CONFIDENCE_HISTOGRAM.observe(confidence)
+            await asyncio.to_thread(_run_graph_sync)
 
-    # ── Decide: auto-resume or hold ───────────────────────────────────────────
-    paused_at_act = snapshot.next and "act" in snapshot.next
+        snapshot   = astra_graph.get_state(config)
+        values     = snapshot.values
+        confidence = values.get("confidence", 0.0)
 
-    if paused_at_act and confidence >= settings.confidence_threshold:
-        # Confidence is sufficient — auto-resume and execute the fix
-        logger.info(
-            "Auto-resuming workflow",
-            extra={"thread_id": thread_id, "confidence": confidence, "tool": values.get("tool")},
+        # Record confidence in Prometheus histogram
+        CONFIDENCE_HISTOGRAM.observe(confidence)
+
+        # ── Decide: auto-resume or hold ───────────────────────────────────────
+        paused_at_act = snapshot.next and "act" in snapshot.next
+
+        if paused_at_act and confidence >= settings.confidence_threshold:
+            # Confidence is sufficient — auto-resume and execute the fix
+            logger.info(
+                "Auto-resuming workflow",
+                extra={"thread_id": thread_id, "confidence": confidence, "tool": values.get("tool")},
+            )
+            def _resume_graph_sync() -> None:
+                for _ in astra_graph.stream(None, config):
+                    pass
+
+            await asyncio.to_thread(_resume_graph_sync)
+
+            snapshot = astra_graph.get_state(config)
+            values   = snapshot.values
+
+            ALERTS_RESOLVED.labels(tool=values.get("tool", "unknown")).inc()
+            record_workflow_outcome(audit_event, values, status="resolved")
+
+        elif paused_at_act:
+            # Confidence is too low — hold for human approval and notify Slack
+            logger.warning(
+                "Workflow paused — confidence below threshold",
+                extra={"thread_id": thread_id, "confidence": confidence, "threshold": settings.confidence_threshold},
+            )
+            ALERTS_PAUSED.labels(tool=values.get("tool", "unknown")).inc()
+            record_workflow_outcome(audit_event, values, status="paused")
+
+            send_hitl_request(
+                thread_id=thread_id,
+                alert_name=payload.alert,
+                pod=payload.pod,
+                namespace=payload.namespace,
+                diagnosis=values.get("diagnosis", ""),
+                severity=values.get("severity", ""),
+                tool=values.get("tool", ""),
+                confidence=confidence,
+            )
+
+        else:
+            # Graph finished without pausing (unexpected — shouldn't happen with interrupt_before)
+            ALERTS_RESOLVED.labels(tool=values.get("tool", "unknown")).inc()
+            record_workflow_outcome(audit_event, values, status="resolved")
+
+    except Exception as exc:
+        # ── Safety net: catch ALL failures so the audit trail is never incomplete
+        # This includes LLM rate limits (429), network errors, and unexpected bugs.
+        logger.error(
+            "Background workflow failed — recording error in audit log",
+            exc_info=True,
+            extra={"thread_id": thread_id, "alert": payload.alert, "pod": payload.pod},
         )
-        for _ in astra_graph.stream(None, config):
-            pass
-
-        snapshot = astra_graph.get_state(config)
-        values   = snapshot.values
-
-        ALERTS_RESOLVED.labels(tool=values.get("tool", "unknown")).inc()
-        record_workflow_outcome(audit_event, values, status="resolved")
-        status  = "resolved"
-        message = "Astra resolved the issue automatically."
-
-    elif paused_at_act:
-        # Confidence is too low — hold for human approval and notify Slack
-        logger.warning(
-            "Workflow paused — confidence below threshold",
-            extra={"thread_id": thread_id, "confidence": confidence, "threshold": settings.confidence_threshold},
-        )
-        ALERTS_PAUSED.labels(tool=values.get("tool", "unknown")).inc()
-        record_workflow_outcome(audit_event, values, status="paused")
-
-        send_hitl_request(
-            thread_id=thread_id,
-            alert_name=payload.alert,
-            pod=payload.pod,
-            namespace=payload.namespace,
-            diagnosis=values.get("diagnosis", ""),
-            severity=values.get("severity", ""),
-            tool=values.get("tool", ""),
-            confidence=confidence,
-        )
-
-        status  = "paused_for_approval"
-        message = (
-            f"Confidence {confidence:.0%} is below the {settings.confidence_threshold:.0%} threshold. "
-            f"A Slack notification has been sent. "
-            f"Call POST /threads/{thread_id}/approve to proceed or abort."
-        )
-
-    else:
-        # Graph finished without pausing (unexpected — shouldn't happen with interrupt_before)
-        ALERTS_RESOLVED.labels(tool=values.get("tool", "unknown")).inc()
-        record_workflow_outcome(audit_event, values, status="resolved")
-        status  = "resolved"
-        message = "Workflow completed."
-
-    return WebhookResponse(
-        status=status,
-        message=message,
-        thread_id=thread_id,
-        result=AgentResult(
-            diagnosis=values.get("diagnosis"),
-            severity=values.get("severity"),
-            investigation_summary=values.get("investigation_summary"),
-            action_planned=values.get("action"),
-            tool=values.get("tool"),
-            confidence=values.get("confidence"),
-            tool_result=values.get("tool_result"),
-        ),
-    )
+        # Write an error record so operators can see the failure in /history
+        record_workflow_outcome(audit_event, {}, status=f"error: {type(exc).__name__}: {exc}")
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -185,8 +220,14 @@ def _run_workflow(payload: AlertPayload) -> WebhookResponse:
         "executes it automatically (high confidence) or requests human approval (low confidence)."
     ),
 )
-async def receive_webhook(payload: AlertPayload) -> WebhookResponse:
-    return _run_workflow(payload)
+async def receive_webhook(payload: AlertPayload, background_tasks: BackgroundTasks) -> WebhookResponse:
+    thread_id = str(uuid.uuid4())
+    background_tasks.add_task(_run_workflow, payload, thread_id)
+    return WebhookResponse(
+        status="processing",
+        message="Alert received and queued for asynchronous background investigation.",
+        thread_id=thread_id
+    )
 
 
 @router.post(
@@ -199,11 +240,21 @@ async def receive_webhook(payload: AlertPayload) -> WebhookResponse:
         "Configure Alertmanager to send webhooks to this URL."
     ),
 )
-async def receive_alertmanager(payload: AlertmanagerPayload) -> list[WebhookResponse]:
+async def receive_alertmanager(payload: AlertmanagerPayload, background_tasks: BackgroundTasks) -> list[WebhookResponse]:
     alerts = parse_alertmanager_payload(payload.model_dump())
     if not alerts:
         return []
-    return [_run_workflow(alert) for alert in alerts]
+        
+    responses = []
+    for alert in alerts:
+        thread_id = str(uuid.uuid4())
+        background_tasks.add_task(_run_workflow, alert, thread_id)
+        responses.append(WebhookResponse(
+            status="processing",
+            message="Alert received and queued for asynchronous background investigation.",
+            thread_id=thread_id
+        ))
+    return responses
 
 
 @router.post(
@@ -224,21 +275,48 @@ async def approve_workflow(thread_id: str, req: ApproveRequest) -> ApproveRespon
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Thread '{thread_id}' was not found or is not waiting for approval. "
-                "It may have already been resolved, approved, or the server may have restarted "
-                "(MemorySaver does not survive restarts — Phase 5 will add persistence)."
+                f"Thread '{thread_id}' was not found or is not currently paused for approval. "
+                "Possible reasons: it was already resolved or approved, it is still processing "
+                "in the background (check GET /history), or the thread_id is invalid. "
+                "Workflow state is persisted to 'astra_checkpoints.db' and survives server restarts."
             ),
         )
 
     if req.approved:
         logger.info("Operator approved workflow", extra={"thread_id": thread_id})
-        for _ in astra_graph.stream(None, config):
-            pass
+        def _resume_approval_sync() -> None:
+            for _ in astra_graph.stream(None, config):
+                pass
+
+        await asyncio.to_thread(_resume_approval_sync)
 
         final  = astra_graph.get_state(config)
         values = final.values
 
         ALERTS_APPROVED.inc()
+        ALERTS_RESOLVED.labels(tool=values.get("tool", "unknown")).inc()
+
+        # Update audit record to resolved
+        from app.db.models import AuditEvent
+        from app.db.database import insert_audit_event
+        from datetime import datetime, timezone
+
+        alert_info = values.get("alert", {})
+        audit_event = AuditEvent(
+            thread_id=thread_id,
+            alert_name=alert_info.get("alert", "Manual Approval"),
+            pod=alert_info.get("pod", "unknown"),
+            namespace=alert_info.get("namespace", "default"),
+            diagnosis=values.get("diagnosis"),
+            severity=values.get("severity"),
+            tool=values.get("tool"),
+            confidence=values.get("confidence"),
+            investigation_summary=values.get("investigation_summary"),
+            tool_result=values.get("tool_result"),
+            status="resolved",
+        )
+        insert_audit_event(settings.audit_db_path, audit_event)
+
         return ApproveResponse(
             status="resumed_and_completed",
             tool_result=values.get("tool_result"),
@@ -247,6 +325,28 @@ async def approve_workflow(thread_id: str, req: ApproveRequest) -> ApproveRespon
     else:
         logger.info("Operator rejected workflow", extra={"thread_id": thread_id})
         ALERTS_REJECTED.inc()
+
+        from app.db.models import AuditEvent
+        from app.db.database import insert_audit_event
+        from datetime import datetime, timezone
+
+        values = snapshot.values
+        alert_info = values.get("alert", {})
+        audit_event = AuditEvent(
+            thread_id=thread_id,
+            alert_name=alert_info.get("alert", "Manual Rejection"),
+            pod=alert_info.get("pod", "unknown"),
+            namespace=alert_info.get("namespace", "default"),
+            diagnosis=values.get("diagnosis"),
+            severity=values.get("severity"),
+            tool=values.get("tool"),
+            confidence=values.get("confidence"),
+            investigation_summary=values.get("investigation_summary"),
+            tool_result="Operator rejected proposed remediation.",
+            status="aborted",
+        )
+        insert_audit_event(settings.audit_db_path, audit_event)
+
         return ApproveResponse(status="aborted")
 
 
