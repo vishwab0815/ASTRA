@@ -6,15 +6,10 @@ FastAPI uses these for:
   - Input validation (rejects malformed requests before they reach the agent)
   - Automatic Swagger/OpenAPI documentation at /docs
   - Type-safe response serialisation
-
-Adding a new endpoint:
-  1. Define an inbound model (if the endpoint has a request body)
-  2. Define an outbound model
-  3. Use them as type annotations in routes.py
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 
 # ── Inbound Schemas ───────────────────────────────────────────────────────────
@@ -29,7 +24,7 @@ class AlertPayload(BaseModel):
     namespace: str = Field(default="default", description="Kubernetes namespace")
 
     model_config = {
-        "extra": "allow",  # Accept and forward any extra fields from the alert source
+        "extra": "allow",
         "json_schema_extra": {
             "example": {
                 "alert":     "PodCrashLoopBackOff",
@@ -45,8 +40,6 @@ class AlertmanagerPayload(BaseModel):
     """
     Prometheus Alertmanager webhook body.
     Used by the /alertmanager endpoint — Astra parses this into AlertPayloads internally.
-
-    Reference: https://prometheus.io/docs/alerting/latest/configuration/#webhook_config
     """
     version:  str  = Field(default="4")
     status:   str  = Field(..., description="firing | resolved")
@@ -106,7 +99,103 @@ class HistoryRecord(BaseModel):
     created_at:             str
 
 
+class LiveTelemetryResponse(BaseModel):
+    """Real-time live telemetry response for the dashboard."""
+    status:                 str = "online"
+    timestamp:              str
+    uptime_seconds:         int
+    cpu_percent:            float
+    memory_used_gb:         float
+    memory_total_gb:        float
+    active_workflows:       int
+    queued_workflows:       int
+    resolved_alerts_count:  int
+    confidence_score:       float
+    service_health:         Dict[str, str]
+    recent_logs:            List[str]
+
+
 class HealthResponse(BaseModel):
     """Response for the /health endpoint."""
     status:  str = "healthy"
     version: str = "0.4.0"
+
+
+# ── Topology Graph Schemas ─────────────────────────────────────────────────────
+
+class TopologyNodeMetrics(BaseModel):
+    """Live telemetry metrics embedded in each topology node."""
+    cpu_percent:    float = 0.0
+    mem_mb:         float = 0.0
+    replicas:       int   = 1
+    ready_replicas: int   = 1
+    restart_count:  int   = 0
+    latency_p99_ms: float = 0.0
+    error_rate:     float = 0.0
+
+
+class TopologyNode(BaseModel):
+    """A single node in the live infrastructure topology graph."""
+    id:           str
+    label:        str
+    node_type:    str  # ingress | service | worker | database | cache | queue | external
+    status:       str  # healthy | degraded | crashed | pending
+    namespace:    str  = "production"
+    port:         str  = "8080"
+    image:        str  = ""
+    helm_release: str  = ""
+    metrics:      TopologyNodeMetrics = TopologyNodeMetrics()
+    incidents:    List[str] = []  # thread_ids of active incidents for this node
+
+
+class TopologyEdge(BaseModel):
+    """A directed traffic flow edge between two topology nodes."""
+    id:           str
+    source:       str
+    target:       str
+    protocol:     str   = "HTTP/2"
+    latency_ms:   float = 14.0
+    rps:          float = 0.0
+    error_rate:   float = 0.0
+    is_error:     bool  = False
+
+
+class TopologyGraphResponse(BaseModel):
+    """Full live topology graph returned by GET /topology/graph."""
+    nodes:       List[TopologyNode]
+    edges:       List[TopologyEdge]
+    timestamp:   str
+    namespace:   str = "all"
+
+
+class ScaleRequest(BaseModel):
+    """Request body for POST /topology/scale."""
+    service_id: str  = Field(..., description="Node ID / service name to scale")
+    namespace:  str  = Field(default="production", description="Kubernetes namespace")
+    replicas:   int  = Field(..., ge=0, le=20, description="Target replica count")
+    image:      Optional[str] = Field(None, description="Optional new container image tag")
+
+
+class ScaleResponse(BaseModel):
+    """Response from POST /topology/scale."""
+    success:    bool
+    message:    str
+    service_id: str
+    replicas:   int
+    job_id:     str = ""
+
+
+class RemediateRequest(BaseModel):
+    """Request body for POST /topology/remediate."""
+    service_id: str = Field(..., description="Node ID / service name to remediate")
+    namespace:  str = Field(default="production")
+    action:     str = Field(..., description="restart | rollback | scale_down | cordon")
+
+
+class RemediateResponse(BaseModel):
+    """Response from POST /topology/remediate."""
+    success:    bool
+    message:    str
+    thread_id:  str = ""
+    action:     str = ""
+
